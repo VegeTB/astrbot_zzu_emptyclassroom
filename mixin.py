@@ -259,7 +259,6 @@ class EmptyClassroomToolMixin:
                     return ut
                 raise RuntimeError("未检测到 zzupy 库，且未配置可用的 user_token。")
 
-            # 1. 如果已有 token 且只是触发了刷新，优先用 set_token 尝试无密码续期
             if ut and rt and force_refresh:
                 cas = CASClient(account or "", password or "")
                 try:
@@ -273,7 +272,6 @@ class EmptyClassroomToolMixin:
                 finally:
                     await cas.close()
 
-            # 2. 若配置了账密，尝试 CAS 登录
             if not account or not password:
                 if ut and not force_refresh:
                     return ut
@@ -296,6 +294,33 @@ class EmptyClassroomToolMixin:
             finally:
                 await cas.close()
 
+    def _enable_zzupy_debug_capture(self) -> tuple[list[str], int | None]:
+        """开启 zzupy 内部脱敏日志捕获，用于诊断 CAS/MFA 原始响应。"""
+        captured_logs: list[str] = []
+        sink_id = None
+        try:
+            from loguru import logger as loguru_logger
+
+            loguru_logger.enable("zzupy")
+            sink_id = loguru_logger.add(
+                lambda m: captured_logs.append(str(m).strip()),
+                filter="zzupy",
+                level="DEBUG",
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return captured_logs, sink_id
+
+    def _disable_zzupy_debug_capture(self, sink_id: int | None) -> None:
+        try:
+            from loguru import logger as loguru_logger
+
+            if sink_id is not None:
+                loguru_logger.remove(sink_id)
+            loguru_logger.disable("zzupy")
+        except Exception:  # noqa: BLE001
+            pass
+
     async def _interactive_cas_login(self) -> str:
         account = str(self.config.get("zzu_account") or "").strip()
         password = str(self.config.get("zzu_password") or "").strip()
@@ -311,16 +336,7 @@ class EmptyClassroomToolMixin:
         if device_id:
             cas.set_device(device_id)
 
-        # 临时捕获 zzupy 脱敏调试日志，便于定位网关具体返回
-        captured_logs: list[str] = []
-        sink_id = None
-        try:
-            from loguru import logger as loguru_logger
-
-            sink_id = loguru_logger.add(lambda m: captured_logs.append(str(m).strip()), level="DEBUG")
-        except Exception:  # noqa: BLE001
-            pass
-
+        captured_logs, sink_id = self._enable_zzupy_debug_capture()
         try:
             await cas.login(force_login=True)
             if cas.user_token:
@@ -331,7 +347,7 @@ class EmptyClassroomToolMixin:
             return "⚠️ 登录返回但未获得 user_token。"
         except MFAError:
             try:
-                # 必须复用 cas 实例自带的 cas.mfa（保留 cas.login() 中取得的 state）
+                # 必须使用 cas 实例自带的 cas.mfa（里面存有 cas.login() 时刚拿到的 state）
                 mfa = cas.mfa
                 await mfa.send_sms()
                 self._pending_mfa_cas = cas
@@ -342,30 +358,25 @@ class EmptyClassroomToolMixin:
                 )
             except Exception as mfa_exc:  # noqa: BLE001
                 await cas.close()
-                debug_tail = "\n".join(captured_logs[-6:]) if captured_logs else "无调试日志"
+                debug_tail = "\n".join(captured_logs[-8:]) if captured_logs else "无调试日志"
                 return (
                     f"❌ 需要 MFA 验证但发送短信失败：{mfa_exc}\n"
                     f"（状态: required={cas.mfa.required}, secure_phone={cas.mfa.secure_phone_available}, has_state={bool(cas.mfa.state)}）\n"
-                    f"📋 调试日志：\n{debug_tail[-800:]}"
+                    f"📋 调试日志：\n{debug_tail[-1000:]}"
                 )
         except Exception as exc:  # noqa: BLE001
             await cas.close()
-            debug_tail = "\n".join(captured_logs[-6:]) if captured_logs else "无调试日志"
-            return f"❌ 登录失败：{exc}\n📋 调试日志：\n{debug_tail[-800:]}"
+            debug_tail = "\n".join(captured_logs[-8:]) if captured_logs else "无调试日志"
+            return f"❌ 登录失败：{exc}\n📋 调试日志：\n{debug_tail[-1000:]}"
         finally:
-            if sink_id is not None:
-                try:
-                    from loguru import logger as loguru_logger
-
-                    loguru_logger.remove(sink_id)
-                except Exception:  # noqa: BLE001
-                    pass
+            self._disable_zzupy_debug_capture(sink_id)
 
     async def _interactive_cas_verify_sms(self, code: str) -> str:
         if not self._pending_mfa_cas or not self._pending_mfa_client:
             return "⚠️ 当前没有等待验证的登录会话，请先发送 `/空教室登录`。"
         cas = self._pending_mfa_cas
         mfa = self._pending_mfa_client
+        captured_logs, sink_id = self._enable_zzupy_debug_capture()
         try:
             await mfa.verify_sms(code)
             await cas.login(force_login=True)
@@ -374,8 +385,10 @@ class EmptyClassroomToolMixin:
                 return "✅ MFA 短信验证并登录成功！Token 已安全缓存，后续查空教室将直接复用（建议顺便去安全中心设为可信设备）。"
             return "⚠️ 验证通过但未获取到 user_token，请重试 `/空教室登录`。"
         except Exception as exc:  # noqa: BLE001
-            return f"❌ 验证码校验失败：{exc}"
+            debug_tail = "\n".join(captured_logs[-6:]) if captured_logs else "无调试日志"
+            return f"❌ 验证码校验失败：{exc}\n📋 调试日志：\n{debug_tail[-800:]}"
         finally:
+            self._disable_zzupy_debug_capture(sink_id)
             await self._close_zzu_runtime()
 
     # ------------------------------------------------------------------ #
@@ -401,7 +414,6 @@ class EmptyClassroomToolMixin:
             }
             cookies = {"userToken": token}
 
-            # trust_env=False 绕过 Clash 代理；follow_redirects=False 精准识别 nox 302 拦截
             async with httpx.AsyncClient(
                 timeout=timeout,
                 trust_env=False,
@@ -412,7 +424,6 @@ class EmptyClassroomToolMixin:
                 else:
                     resp = await client.post(url, json=json_body, headers=headers, cookies=cookies)
 
-            # 1. 检测 302 零信任网关 / CAS 跳转
             if resp.status_code in (301, 302, 303, 307, 308):
                 loc = resp.headers.get("location", "")
                 if "nox" in loc.lower() or "portal" in loc.lower():
@@ -423,7 +434,6 @@ class EmptyClassroomToolMixin:
                     continue
                 raise _ZzuAuthExpiredError(f"教务接口发生重定向 ({resp.status_code} -> {loc})，Token 可能已失效。")
 
-            # 2. 检测 401 未认证 / Token 过期
             if resp.status_code == 401:
                 if attempt == 0:
                     logger.info("[ZZUEmptyClassroom] 教务返回 401，尝试刷新/重登 Token 后重试一次...")
@@ -473,7 +483,6 @@ class EmptyClassroomToolMixin:
         cached = self._building_cache.get(campus_id)
         if cached and now - cached[0] < 86400:
             return cached[1]
-        # 文档注明 campusAssoc 为必填参数
         data = await self._eas_request("GET", "/room/place/building", params={"campusAssoc": campus_id})
         items = data if isinstance(data, list) else (data.get("list") or data.get("rows") or data.get("data") or [])
         buildings = [b for b in items if isinstance(b, dict) and b.get("id") is not None]
@@ -517,18 +526,15 @@ class EmptyClassroomToolMixin:
         def norm(s: str) -> str:
             return re.sub(r"[\s_\-教学楼]", "", s.lower())
 
-        # 1. 精确匹配
         exact = [b for b in buildings if b_name(b).lower() == q.lower() or str(b.get("code") or "").lower() == q.lower()]
         if exact:
             return [int(b["id"]) for b in exact], [b_name(b) for b in exact]
 
-        # 2. 归一化精确匹配 (如 "北1楼" -> "北1")
         nq = norm(q)
         norm_exact = [b for b in buildings if norm(b_name(b)) == nq]
         if norm_exact:
             return [int(b["id"]) for b in norm_exact], [b_name(b) for b in norm_exact]
 
-        # 3. 包含匹配
         partial = [b for b in buildings if nq in norm(b_name(b)) or norm(b_name(b)) in nq]
         if partial:
             return [int(b["id"]) for b in partial], [b_name(b) for b in partial]
@@ -545,7 +551,6 @@ class EmptyClassroomToolMixin:
         cache_key = (date_str, campus_id, tuple(sorted(building_ids)))
         now = time.time()
 
-        # 顺便清理过期缓存
         for k in list(self._rooms_cache.keys()):
             if now - self._rooms_cache[k][0] >= ttl:
                 self._rooms_cache.pop(k, None)
@@ -623,7 +628,6 @@ class EmptyClassroomToolMixin:
             occ_e = self._parse_hhmm(occ.get("endTime") or occ.get("endTimeString"))
             if occ_s is None or occ_e is None:
                 continue
-            # 区间严格相交判定
             if occ_s < unit_end and unit_start < occ_e:
                 return False
         return True
@@ -639,7 +643,6 @@ class EmptyClassroomToolMixin:
         norm_date = self._normalize_date(date)
         norm_building = (building or "").strip()
 
-        # 1. 获取校区 ID
         campus_map = await self._get_campus_map()
         campus_id = campus_map.get(norm_campus)
         if campus_id is None:
@@ -651,7 +654,6 @@ class EmptyClassroomToolMixin:
         if campus_id is None:
             return f"⚠️ 未找到校区「{norm_campus}」，可选校区有：{', '.join(campus_map.keys())}"
 
-        # 2. 解析教学楼 ID
         building_ids: list[int] = []
         matched_b_names: list[str] = []
         if norm_building:
@@ -661,14 +663,11 @@ class EmptyClassroomToolMixin:
                 avail = [str(b.get("nameZh") or b.get("name") or "") for b in buildings[:20]]
                 return f"⚠️ 在【{norm_campus}】未找到教学楼「{norm_building}」。\n可选楼栋参考：{', '.join(avail)}"
 
-        # 3. 获取节次表与解析查询节次
         units_map = await self._get_course_units()
         target_units, period_label = self._parse_periods_to_units(periods, norm_date, units_map)
 
-        # 4. 分页拉取教室占用表
         rooms = await self._fetch_all_rooms(norm_date, campus_id, building_ids)
 
-        # 5. 反算空闲教室（排除 virtual 虚拟教室；不筛选 enabled/seatsForLesson）
         free_rooms: list[tuple[str, str]] = []
         for room in rooms:
             if room.get("virtual") is True:
@@ -686,7 +685,6 @@ class EmptyClassroomToolMixin:
                     break
 
             if all_target_free:
-                # 顺便算一下今天各大节的空闲概况，给用户更实用的参考
                 free_blocks = []
                 for a, b in BIG_BLOCKS:
                     a_s = units_map.get(a, DEFAULT_UNITS[a])[0]
@@ -696,7 +694,6 @@ class EmptyClassroomToolMixin:
                 block_desc = "全天空闲" if len(free_blocks) == len(BIG_BLOCKS) else f"今日空:{','.join(free_blocks)}节"
                 free_rooms.append((r_name, block_desc))
 
-        # 排序
         free_rooms.sort(key=lambda x: x[0])
 
         bldg_display = ", ".join(matched_b_names) if matched_b_names else (norm_building or "全部教学楼")
