@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import re
 import time
+import urllib.parse
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -15,12 +17,21 @@ from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 
 try:
     from zzupy.aio.app.auth import CASClient
+    from zzupy.crypto import load_pem_public_key
     from zzupy.exception import MFAError
 except Exception:  # noqa: BLE001
     CASClient = None
+    load_pem_public_key = None
     MFAError = Exception
 
 EAS_API_BASE = "https://jwxt.zzu.edu.cn/eams-micro-server/api/v1"
+NOX_BASE = "https://nox.zzu.edu.cn"
+DEFAULT_NOX_PORTAL_URL = (
+    "https://nox.zzu.edu.cn/portal.php"
+    "?app_uuid=6e1c257b-1bf8-40ca-b66a-6c7e9fea0acf"
+    "&qaxtrustsso=true"
+    "&redirect_url=https%3A%2F%2Fjwxt.zzu.edu.cn%2Feams-micro-server%2Fapi%2Fv1%2Froom%2Fplace%2Fcampus"
+)
 
 CAMPUS_ALIAS_MAP = {
     "主校区": "主校区",
@@ -99,17 +110,18 @@ class _ZzuAuthExpiredError(RuntimeError):
 
 
 class EmptyClassroomToolMixin:
-    """郑州大学新教务空教室查询核心逻辑（直连 eams-micro-server + zzupy CAS Token 持久化）。"""
+    """郑州大学新教务空教室查询核心逻辑（自动过 nox 零信任网关 + CAS Token 持久化）。"""
 
     def _init_zzu_runtime(self) -> None:
         self._data_dir = Path(get_astrbot_plugin_data_path()) / "astrbot_zzu_emptyclassroom"
         self._data_dir.mkdir(parents=True, exist_ok=True)
         self._token_file = self._data_dir / "cas_token.json"
+        self._nox_cookie_file = self._data_dir / "nox_cookies.json"
         self._auth_lock = asyncio.Lock()
+        self._nox_lock = asyncio.Lock()
         self._pending_mfa_cas = None
         self._pending_mfa_client = None
 
-        # 内存字典与查询缓存
         self._campus_cache: tuple[float, dict[str, int]] | None = None
         self._building_cache: dict[int, tuple[float, list[dict[str, Any]]]] = {}
         self._units_cache: tuple[float, dict[int, tuple[int, int, str]]] | None = None
@@ -179,7 +191,6 @@ class EmptyClassroomToolMixin:
     def _parse_periods_to_units(
         self, periods: str, date_str: str, units_map: dict[int, tuple[int, int, str]]
     ) -> tuple[list[int], str]:
-        """将用户输入节次解析为节次编号列表与可读标签。"""
         max_unit = max(units_map.keys()) if units_map else 10
         p = (periods or "").strip()
 
@@ -217,7 +228,7 @@ class EmptyClassroomToolMixin:
         return unique_units, f"第{p}节" if p.isdigit() or "-" in p else p
 
     # ------------------------------------------------------------------ #
-    # Token 持久化与 zzupy CAS 认证维护（避免频繁账密登录踢下线）
+    # Token 持久化与 CAS 认证
     # ------------------------------------------------------------------ #
     def _load_saved_tokens(self) -> tuple[str, str]:
         cfg_ut = str(self.config.get("user_token") or "").strip()
@@ -244,7 +255,6 @@ class EmptyClassroomToolMixin:
             logger.warning(f"[ZZUEmptyClassroom] 保存 Token 失败: {exc}")
 
     async def _get_valid_token(self, force_refresh: bool = False) -> str:
-        """优先复用本地/配置 Token；仅在无效或强制刷新时尝试 CAS 续期或登录。"""
         async with self._auth_lock:
             ut, rt = self._load_saved_tokens()
             if ut and not force_refresh:
@@ -268,7 +278,7 @@ class EmptyClassroomToolMixin:
                         self._save_tokens(cas.user_token, cas.refresh_token or rt)
                         return cas.user_token
                 except Exception as exc:  # noqa: BLE001
-                    logger.debug(f"[ZZUEmptyClassroom] Token 无感续期失败，准备降级账密登录: {exc}")
+                    logger.debug(f"[ZZUEmptyClassroom] Token 无感续期失败: {exc}")
                 finally:
                     await cas.close()
 
@@ -289,13 +299,12 @@ class EmptyClassroomToolMixin:
                 raise RuntimeError("CAS 登录成功但未返回 user_token。")
             except MFAError as exc:
                 raise RuntimeError(
-                    "触发了郑大统一认证 MFA 短信校验，请管理员在群聊或私聊发送 `/空教室登录` 获取短信并完成验证。"
+                    "触发了郑大统一认证 MFA 短信校验，请发送 `/空教室登录` 完成验证。"
                 ) from exc
             finally:
                 await cas.close()
 
     def _enable_zzupy_debug_capture(self) -> tuple[list[str], int | None]:
-        """开启 zzupy 内部脱敏日志捕获，用于诊断 CAS/MFA 原始响应。"""
         captured_logs: list[str] = []
         sink_id = None
         try:
@@ -342,12 +351,16 @@ class EmptyClassroomToolMixin:
             if cas.user_token:
                 self._save_tokens(cas.user_token, cas.refresh_token or "")
                 await cas.close()
-                return "✅ 郑大统一认证登录成功！Token 已持久化保存，现在可以直接查询空教室。"
+                # 登录完顺便尝试预热一下 nox 零信任网关 Cookie
+                try:
+                    await self._login_nox_gateway(user_token=cas.user_token)
+                    return "✅ 郑大统一认证 & nox 零信任网关均已登录成功！现在可以直接查询空教室。"
+                except Exception as nox_exc:  # noqa: BLE001
+                    return f"✅ CAS 统一认证登录成功（Token 已保存），但预热 nox 网关时提示：{nox_exc}"
             await cas.close()
             return "⚠️ 登录返回但未获得 user_token。"
         except MFAError:
             try:
-                # 必须使用 cas 实例自带的 cas.mfa（里面存有 cas.login() 时刚拿到的 state）
                 mfa = cas.mfa
                 await mfa.send_sms()
                 self._pending_mfa_cas = cas
@@ -382,17 +395,180 @@ class EmptyClassroomToolMixin:
             await cas.login(force_login=True)
             if cas.user_token:
                 self._save_tokens(cas.user_token, cas.refresh_token or "")
-                return "✅ MFA 短信验证并登录成功！Token 已安全缓存，后续查空教室将直接复用（建议顺便去安全中心设为可信设备）。"
+                return "✅ MFA 短信验证并登录成功！Token 已安全缓存。"
             return "⚠️ 验证通过但未获取到 user_token，请重试 `/空教室登录`。"
         except Exception as exc:  # noqa: BLE001
             debug_tail = "\n".join(captured_logs[-6:]) if captured_logs else "无调试日志"
             return f"❌ 验证码校验失败：{exc}\n📋 调试日志：\n{debug_tail[-800:]}"
         finally:
-            self._disable_zzupy_debug_capture(sink_id)
+            self._disable_zzu_debug_capture(sink_id)
             await self._close_zzu_runtime()
 
     # ------------------------------------------------------------------ #
-    # 教务 API 底层请求（含 302 零信任检测 & 401 自动重试一次）
+    # 🛡️ nox.zzu.edu.cn 奇安信零信任网关自动认证 & Cookie 持久化
+    # ------------------------------------------------------------------ #
+    def _save_nox_cookies(self, cookies: httpx.Cookies) -> None:
+        try:
+            items = [
+                {
+                    "name": c.name,
+                    "value": c.value,
+                    "domain": c.domain,
+                    "path": c.path,
+                }
+                for c in cookies.jar
+            ]
+            self._nox_cookie_file.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[ZZUEmptyClassroom] 保存 nox cookies 失败: {exc}")
+
+    def _load_nox_cookies(self) -> httpx.Cookies:
+        jar = httpx.Cookies()
+        if self._nox_cookie_file.exists():
+            try:
+                items = json.loads(self._nox_cookie_file.read_text(encoding="utf-8"))
+                for c in items:
+                    jar.set(c["name"], c["value"], domain=c.get("domain", ""), path=c.get("path", "/"))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"[ZZUEmptyClassroom] 读取 nox cookies 失败: {exc}")
+        return jar
+
+    def _encrypt_nox_password(self, pub_key_b64: str, password: str) -> str:
+        """按 nox 前端逻辑使用 RSA PKCS1v15 加密密码并返回 Base64"""
+        pem_str = f"-----BEGIN PUBLIC KEY-----\n{pub_key_b64.strip()}\n-----END PUBLIC KEY-----"
+        if load_pem_public_key is None:
+            raise RuntimeError("缺少 zzupy.crypto.load_pem_public_key，无法加密 nox 密码。")
+        pub_key = load_pem_public_key(pem_str.encode("utf-8"))
+        encrypted_bytes = pub_key.encrypt(password.encode("utf-8"))
+        return base64.b64encode(encrypted_bytes).decode("ascii")
+
+    async def _login_nox_gateway(self, portal_url: str | None = None, user_token: str = "") -> None:
+        """全自动完成 nox.zzu.edu.cn LDAP 零信任认证并领取 jwxt.zzu.edu.cn 放行 Cookie"""
+        async with self._nox_lock:
+            account = str(self.config.get("zzu_account") or "").strip()
+            password = str(self.config.get("zzu_password") or "").strip()
+            if not account or not password:
+                raise _ZzuGatewayInterceptError(
+                    "教务请求被 nox.zzu.edu.cn 零信任网关拦截，请在插件配置中填写 zzu_account（学号）与 zzu_password（密码）以便自动过网关。"
+                )
+
+            timeout = float(self.config.get("api_timeout", 15) or 15)
+            target_portal = portal_url or DEFAULT_NOX_PORTAL_URL
+            browser_headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                ),
+                "Accept": "application/json, text/plain, */*",
+            }
+
+            logger.info("[ZZUEmptyClassroom] 检测到 nox 零信任拦截，开始自动完成 LDAP 网关认证...")
+
+            async with httpx.AsyncClient(
+                timeout=timeout,
+                trust_env=False,
+                follow_redirects=True,
+                headers=browser_headers,
+            ) as client:
+                # 1. 访问 portal.php 获取 qaxsession
+                await client.get(target_portal)
+
+                # 2. 获取认证状态、LDAP instanceId 及 RSA 公钥
+                status_resp = await client.post(
+                    f"{NOX_BASE}/api/v3/am/authn/current/status",
+                    json={"device": {}, "env": {}},
+                    headers={"Origin": NOX_BASE, "Referer": f"{NOX_BASE}/authn/base/"},
+                )
+                status_json = status_resp.json()
+                status_data = status_json.get("data") if isinstance(status_json.get("data"), dict) else status_json
+
+                # 如果已经登录过了，跳过密码提交
+                next_actions = status_data.get("nextAction") or []
+                if next_actions:
+                    ldap_item = next(
+                        (x for x in next_actions if x.get("type") == "LDAP"),
+                        next(
+                            (x for x in next_actions if x.get("uiType") == "USER_PWD"),
+                            None,
+                        ),
+                    )
+                    if not ldap_item:
+                        raise _ZzuGatewayInterceptError(f"nox 门户未找到 LDAP/账密认证入口: {next_actions}")
+
+                    instance_id = ldap_item.get("instanceId") or "aac7be3b-d847-4280-9e43-7ed36f994f00"
+                    pub_key = (status_data.get("cypher") or {}).get("pubKey") or ""
+                    if not pub_key:
+                        cypher_resp = await client.get(f"{NOX_BASE}/uiapi/v1/config/cypher")
+                        cypher_json = cypher_resp.json()
+                        pub_key = (cypher_json.get("data") or {}).get("pubKey") or ""
+                    if not pub_key:
+                        raise _ZzuGatewayInterceptError("未能从 nox 门户获取到 RSA 公钥。")
+
+                    # 3. 提交 RSA 加密的账密登录 /api/v3/am/authn/login
+                    encrypted_pwd = self._encrypt_nox_password(pub_key, password)
+                    login_payload = {
+                        "authnProperties": [
+                            {
+                                "principal": account,
+                                "credential": encrypted_pwd,
+                                "instanceId": instance_id,
+                                "extParams": {"captcha": ""},
+                            }
+                        ],
+                        "device": {},
+                        "env": {},
+                    }
+                    login_resp = await client.post(
+                        f"{NOX_BASE}/api/v3/am/authn/login",
+                        json=login_payload,
+                        headers={"Origin": NOX_BASE, "Referer": f"{NOX_BASE}/authn/base/"},
+                    )
+                    try:
+                        login_json = login_resp.json()
+                    except Exception as exc:  # noqa: BLE001
+                        raise _ZzuGatewayInterceptError(
+                            f"nox 登录返回非 JSON ({login_resp.status_code}): {login_resp.text[:200]}"
+                        ) from exc
+
+                    l_data = login_json.get("data") if isinstance(login_json.get("data"), dict) else login_json
+                    if login_resp.status_code >= 400 or (
+                        login_json.get("status") not in (None, 0, 200, 204)
+                        and not l_data.get("cacheParam")
+                        and l_data.get("result") not in ("ALLOW", "WARN")
+                    ):
+                        causes = l_data.get("causeDetails") or []
+                        err_detail = causes[0] if causes else (login_json.get("message") or login_json)
+                        raise _ZzuGatewayInterceptError(f"nox LDAP 认证失败: {err_detail}")
+
+                    # 检查设备绑定策略
+                    bind_strategy = l_data.get("deviceBindStrategy") or {}
+                    if bind_strategy.get("status") == "UNBOUND_DEVICE":
+                        raise _ZzuGatewayInterceptError("nox 零信任要求设备绑定审批，无法自动放行。")
+
+                    # 4. 严格复刻前端登录后的表单提交 / 跳转放行逻辑
+                    if l_data.get("cacheParam") and l_data.get("url"):
+                        post_url = urllib.parse.urljoin(f"{NOX_BASE}/authn/base/", l_data["url"])
+                        await client.post(post_url, data=l_data["cacheParam"])
+                    elif (l_data.get("toUrls") or {}).get("redirectUrl"):
+                        redir_url = urllib.parse.urljoin(
+                            f"{NOX_BASE}/authn/base/", l_data["toUrls"]["redirectUrl"]
+                        )
+                        await client.get(redir_url)
+
+                # 5. 携带已认证的 qaxsession 再走一遍 portal.php，完成 OIDC wrapper_portal 换票，让网关把 Cookie 种到 jwxt.zzu.edu.cn
+                if user_token:
+                    client.cookies.set("userToken", user_token, domain=".zzu.edu.cn", path="/")
+                handoff_resp = await client.get(
+                    target_portal,
+                    headers={"Authorization": user_token} if user_token else None,
+                )
+                logger.info(
+                    f"[ZZUEmptyClassroom] nox 网关认证换票完成，最终落点: {handoff_resp.url} (status={handoff_resp.status_code})"
+                )
+                self._save_nox_cookies(client.cookies)
+
+    # ------------------------------------------------------------------ #
+    # 教务 API 底层请求（自动过 nox 302 网关 & 401 自动续期重试）
     # ------------------------------------------------------------------ #
     async def _eas_request(
         self,
@@ -405,40 +581,58 @@ class EmptyClassroomToolMixin:
         timeout = float(self.config.get("api_timeout", 15) or 15)
         url = f"{EAS_API_BASE}{path}"
 
-        for attempt in range(2):
-            token = await self._get_valid_token(force_refresh=(attempt == 1))
+        nox_retried = False
+        token_retried = False
+
+        for _attempt in range(4):
+            token = await self._get_valid_token(force_refresh=token_retried and _attempt > 0)
             headers = {
                 "Authorization": token,
                 "Content-Type": "application/json;charset=UTF-8",
                 "Accept": "application/json",
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                ),
             }
-            cookies = {"userToken": token}
+            cookies = self._load_nox_cookies()
+            cookies.set("userToken", token, domain=".zzu.edu.cn", path="/")
 
             async with httpx.AsyncClient(
                 timeout=timeout,
                 trust_env=False,
                 follow_redirects=False,
+                cookies=cookies,
             ) as client:
                 if method.upper() == "GET":
-                    resp = await client.get(url, params=params, headers=headers, cookies=cookies)
+                    resp = await client.get(url, params=params, headers=headers)
                 else:
-                    resp = await client.post(url, json=json_body, headers=headers, cookies=cookies)
+                    resp = await client.post(url, json=json_body, headers=headers)
 
+            # 1. 检测 302 nox 零信任网关拦截 -> 自动完成 nox LDAP 登录并立即重试
             if resp.status_code in (301, 302, 303, 307, 308):
                 loc = resp.headers.get("location", "")
-                if "nox" in loc.lower() or "portal" in loc.lower():
+                if "nox" in loc.lower() or "portal" in loc.lower() or resp.headers.get("Return-By-AppGateway"):
+                    if not nox_retried:
+                        nox_retried = True
+                        await self._login_nox_gateway(portal_url=loc or DEFAULT_NOX_PORTAL_URL, user_token=token)
+                        continue
                     raise _ZzuGatewayInterceptError(
-                        f"请求教务系统被校园网零信任网关（nox 认证门户）302 拦截（跳转至 {loc}），请先在服务器或同网段环境完成网关认证。"
+                        f"已尝试自动登录 nox 零信任网关但仍被拦截（跳转至 {loc}）。"
                     )
-                if attempt == 0:
+                if not token_retried:
+                    token_retried = True
                     continue
                 raise _ZzuAuthExpiredError(f"教务接口发生重定向 ({resp.status_code} -> {loc})，Token 可能已失效。")
 
+            # 2. 检测 401 Token 失效 -> 自动尝试刷新一次
             if resp.status_code == 401:
-                if attempt == 0:
-                    logger.info("[ZZUEmptyClassroom] 教务返回 401，尝试刷新/重登 Token 后重试一次...")
+                if not token_retried:
+                    token_retried = True
+                    logger.info("[ZZUEmptyClassroom] 教务返回 401，尝试刷新 Token 后重试...")
+                    await self._get_valid_token(force_refresh=True)
                     continue
-                raise _ZzuAuthExpiredError("教务系统返回 401（Token 已失效且自动刷新失败），请重新 `/空教室登录` 或更新 user_token。")
+                raise _ZzuAuthExpiredError("教务系统返回 401（Token 已失效且自动刷新失败），请重新 `/空教室登录`。")
 
             if resp.status_code != 200:
                 raise RuntimeError(f"教务接口 {path} 返回状态码 {resp.status_code}：{resp.text[:200]}")
@@ -474,6 +668,8 @@ class EmptyClassroomToolMixin:
             if mapping:
                 self._campus_cache = (now, mapping)
                 return mapping
+        except _ZzuGatewayInterceptError:
+            raise
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"[ZZUEmptyClassroom] 拉取校区列表失败，使用兜底映射: {exc}")
         return dict(DEFAULT_CAMPUS_MAP)
@@ -510,12 +706,13 @@ class EmptyClassroomToolMixin:
             if units:
                 self._units_cache = (now, units)
                 return units
+        except _ZzuGatewayInterceptError:
+            raise
         except Exception as exc:  # noqa: BLE001
             logger.debug(f"[ZZUEmptyClassroom] 拉取节次表失败，使用兜底时刻表: {exc}")
         return dict(DEFAULT_UNITS)
 
     def _match_buildings(self, building_query: str, buildings: list[dict[str, Any]]) -> tuple[list[int], list[str]]:
-        """模糊匹配教学楼名，返回 (id列表, 名称列表)。"""
         q = (building_query or "").strip()
         if not q:
             return [], []
