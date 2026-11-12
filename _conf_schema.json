@@ -1,70 +1,33 @@
 {
-  "eas_base_url": {
-    "description": "教务接口基础地址",
+  "student_id": {
+    "description": "郑大统一身份认证学号",
     "type": "string",
-    "default": "https://jw.v.zzu.edu.cn",
-    "hint": "对应 EasClient.kt 中的服务端根地址，末尾不要带斜杠",
-    "obvious_hint": true
-  },
-  "classroom_endpoint": {
-    "description": "空教室查询接口路径",
-    "type": "string",
-    "default": "/app-ws/ws/app-service/classroom/query",
-    "hint": "对应 EasClient.kt 中查询教室占用的具体路由路径"
-  },
-  "request_method": {
-    "description": "查询接口请求方式",
-    "type": "string",
-    "default": "GET",
-    "hint": "可选 GET 或 POST，按 EasClient.kt 实际请求方式设置"
-  },
-  "login_endpoint": {
-    "description": "登录获取令牌路径（可选）",
-    "type": "string",
-    "default": "/app-ws/ws/app-service/login",
-    "hint": "若未直接填写下方 Token，插件会向此路径发送账号密码换取令牌"
-  },
-  "eas_token": {
-    "description": "教务访问令牌 (Token)",
-    "type": "string",
-    "default": "",
-    "hint": "留空给你填的教务令牌，填写后优先使用此令牌鉴权",
-    "obvious_hint": true
-  },
-  "username": {
-    "description": "教务系统账号/学号",
-    "type": "string",
-    "default": "",
-    "hint": "留空给你填的教务账号，未填固定 Token 时用于自动登录"
+    "default": ""
   },
   "password": {
-    "description": "教务系统密码",
+    "description": "郑大统一身份认证密码",
     "type": "string",
     "default": "",
-    "hint": "留空给你填的教务密码"
+    "secret": true
   },
-  "token_header_name": {
-    "description": "鉴权请求头字段名",
+  "manual_eas_token": {
+    "description": "可选备用教务 Token（留空则自动通过 ZZU.Py 登录获取）",
     "type": "string",
-    "default": "token",
-    "hint": "常见为 token 或 Authorization（如需 Bearer 前缀可连同前缀填入 Token）"
+    "default": ""
   },
-  "proxy_url": {
-    "description": "校园网代理地址（可选）",
+  "eas_base_url": {
+    "description": "教务移动端服务基础地址",
     "type": "string",
-    "default": "",
-    "hint": "若服务器在校园网外被零信任拦截，可填入 HTTP 代理如 http://127.0.0.1:7890"
+    "default": "https://jw.v.zzu.edu.cn/app-ws/ws/app-service"
   },
-  "page_size": {
-    "description": "单页拉取条数",
-    "type": "int",
-    "default": 50,
-    "hint": "分页遍历每页大小，建议设为 50 到 100"
+  "room_api_path": {
+    "description": "空教室/占用查询接口路径（对应 ZZUPocket EasClient）",
+    "type": "string",
+    "default": "/room/borrow/occupancy/search"
   },
-  "total_sections": {
-    "description": "每日总节次数",
-    "type": "int",
-    "default": 10,
-    "hint": "用于从占用节次反推空闲节次，默认按全天 10 节课计算"
+  "default_campus": {
+    "description": "默认校区名称关键词",
+    "type": "string",
+    "default": "主校区"
   }
 }
