@@ -1,33 +1,69 @@
 {
-  "student_id": {
-    "description": "郑大统一身份认证学号",
-    "type": "string",
-    "default": ""
-  },
-  "password": {
-    "description": "郑大统一身份认证密码",
+  "zzu_account": {
+    "description": "郑大学号（统一身份认证账号）",
     "type": "string",
     "default": "",
-    "secret": true
+    "hint": "与 user_token 二选一填写即可。首次登录若触发短信验证，请在聊天中发 /空教室登录"
   },
-  "manual_eas_token": {
-    "description": "可选备用教务 Token（留空则自动通过 ZZU.Py 登录获取）",
+  "zzu_password": {
+    "description": "统一身份认证密码",
+    "type": "string",
+    "default": "",
+    "obvious_hint": true,
+    "hint": "仅在无有效 Token 或 Token 过期时登录使用，平时只复用本地缓存的 Token，不会踢掉手机 App"
+  },
+  "user_token": {
+    "description": "手动指定 userToken（可选）",
+    "type": "string",
+    "default": "",
+    "hint": "如果不想填密码，可直接填入抓包获得的 CAS userToken"
+  },
+  "refresh_token": {
+    "description": "手动指定 refreshToken（可选）",
     "type": "string",
     "default": ""
   },
-  "eas_base_url": {
-    "description": "教务移动端服务基础地址",
+  "device_id": {
+    "description": "CAS 设备标识（deviceId）",
     "type": "string",
-    "default": "https://jw.v.zzu.edu.cn/app-ws/ws/app-service"
-  },
-  "room_api_path": {
-    "description": "空教室/占用查询接口路径（对应 ZZUPocket EasClient）",
-    "type": "string",
-    "default": "/room/borrow/occupancy/search"
+    "default": "astrbot_zzu_emptyclassroom",
+    "hint": "建议保持独立标识，不要使用默认的 ZZU.Py"
   },
   "default_campus": {
-    "description": "默认校区名称关键词",
+    "description": "默认查询校区",
     "type": "string",
-    "default": "主校区"
+    "default": "主校区",
+    "options": ["主校区", "南校区", "北校区", "东校区", "南校区·河南音乐学院"]
+  },
+  "api_timeout": {
+    "description": "教务接口请求超时时间（秒）",
+    "type": "int",
+    "default": 15
+  },
+  "cache_minutes": {
+    "description": "空教室占用数据缓存时间（分钟）",
+    "type": "int",
+    "default": 15,
+    "hint": "建议 10-30 分钟，避免频繁请求教务接口"
+  },
+  "max_rooms_display": {
+    "description": "单次最多展示的空闲教室数量",
+    "type": "int",
+    "default": 30
+  },
+  "register_llm_tools": {
+    "description": "向大模型注册空教室查询工具",
+    "type": "bool",
+    "default": true
+  },
+  "allowed_users": {
+    "description": "允许使用该插件的用户 ID 列表（留空表示不限制）",
+    "type": "list",
+    "default": []
+  },
+  "allowed_groups": {
+    "description": "允许使用该插件的群号列表（留空表示不限制）",
+    "type": "list",
+    "default": []
   }
 }
