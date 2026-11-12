@@ -221,15 +221,7 @@ class ZZUClassroomMixin:
             lines.append("部分节次空闲参考：" + "、".join(partial_free_rooms[:20]))
 
         return "\n".join(lines)
-```
 
----
-
-### 插件主入口与 LLM 工具注册（`main.py`）
-
-把 `@filter.llm_tool` 直接声明在 `main.py` 的 `Star` 子类里，严格按照 AstrBot 解析器要求的 `参数名(类型): 说明` 格式编写文档字符串，同时附带一个 `/查空教室` 测试指令方便老父亲直接排查连通性：
-
-```python
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
