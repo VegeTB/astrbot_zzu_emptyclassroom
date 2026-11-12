@@ -308,7 +308,19 @@ class EmptyClassroomToolMixin:
 
         await self._close_zzu_runtime()
         cas = CASClient(account, password)
-        cas.set_device(device_id)
+        if device_id:
+            cas.set_device(device_id)
+
+        # 临时捕获 zzupy 脱敏调试日志，便于定位网关具体返回
+        captured_logs: list[str] = []
+        sink_id = None
+        try:
+            from loguru import logger as loguru_logger
+
+            sink_id = loguru_logger.add(lambda m: captured_logs.append(str(m).strip()), level="DEBUG")
+        except Exception:  # noqa: BLE001
+            pass
+
         try:
             await cas.login(force_login=True)
             if cas.user_token:
@@ -319,20 +331,35 @@ class EmptyClassroomToolMixin:
             return "⚠️ 登录返回但未获得 user_token。"
         except MFAError:
             try:
-                mfa = CASClient.MFAClient(cas)
+                # 必须复用 cas 实例自带的 cas.mfa（保留 cas.login() 中取得的 state）
+                mfa = cas.mfa
                 await mfa.send_sms()
                 self._pending_mfa_cas = cas
                 self._pending_mfa_client = mfa
                 return (
-                    "📱 检测到新设备需要短信 MFA 二次验证，已尝试向你的绑定手机发送验证码！\n"
+                    "📱 检测到新设备需要短信 MFA 二次验证，已向你的绑定手机发送验证码！\n"
                     "请在收到短信后发送：`/空教室验证码 <6位验证码>`"
                 )
             except Exception as mfa_exc:  # noqa: BLE001
                 await cas.close()
-                return f"❌ 需要 MFA 验证但发送短信失败：{mfa_exc}"
+                debug_tail = "\n".join(captured_logs[-6:]) if captured_logs else "无调试日志"
+                return (
+                    f"❌ 需要 MFA 验证但发送短信失败：{mfa_exc}\n"
+                    f"（状态: required={cas.mfa.required}, secure_phone={cas.mfa.secure_phone_available}, has_state={bool(cas.mfa.state)}）\n"
+                    f"📋 调试日志：\n{debug_tail[-800:]}"
+                )
         except Exception as exc:  # noqa: BLE001
             await cas.close()
-            return f"❌ 登录失败：{exc}"
+            debug_tail = "\n".join(captured_logs[-6:]) if captured_logs else "无调试日志"
+            return f"❌ 登录失败：{exc}\n📋 调试日志：\n{debug_tail[-800:]}"
+        finally:
+            if sink_id is not None:
+                try:
+                    from loguru import logger as loguru_logger
+
+                    loguru_logger.remove(sink_id)
+                except Exception:  # noqa: BLE001
+                    pass
 
     async def _interactive_cas_verify_sms(self, code: str) -> str:
         if not self._pending_mfa_cas or not self._pending_mfa_client:
